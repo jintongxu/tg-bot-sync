@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+.env
+*.sqlite
+*.sqlite3
+*.db
+received/
+*.log
+.workflow/
+.DS_Store
