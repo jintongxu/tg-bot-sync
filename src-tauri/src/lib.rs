@@ -24,6 +24,46 @@ fn decrypt_token(value:&str)->String { use windows_sys::Win32::Security::Cryptog
 #[cfg(not(windows))] fn decrypt_token(value:&str)->String { value.strip_prefix("plain:").unwrap_or(value).to_string() }
 fn persist<T: Serialize>(path: PathBuf, value: &T) { if let Ok(json) = serde_json::to_string_pretty(value) { let _ = fs::write(path, json); } }
 fn load<T: for<'a> Deserialize<'a> + Default>(path: PathBuf) -> T { fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default() }
+fn settings_backup_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    { std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("TG Bot Sync").join("settings.json")) }
+    #[cfg(not(windows))]
+    { None }
+}
+fn persist_settings(data_dir: &Path, settings: &Settings) {
+    let mut stored = settings.clone();
+    if stored.token.trim().is_empty() {
+        let existing: Settings = load(data_dir.join("settings.json"));
+        if !existing.token.trim().is_empty() { stored.token = existing.token; }
+    } else {
+        stored.token = encrypt_token(stored.token.trim());
+    }
+    let primary = data_dir.join("settings.json");
+    persist(primary, &stored);
+    if let Some(backup) = settings_backup_path() {
+        if let Some(parent) = backup.parent() { let _ = fs::create_dir_all(parent); }
+        persist(backup, &stored);
+    }
+}
+fn load_settings(data_dir: &Path) -> Settings {
+    let primary = data_dir.join("settings.json");
+    let primary_settings = fs::read_to_string(&primary).ok().and_then(|contents| serde_json::from_str::<Settings>(&contents).ok());
+    let backup_settings = settings_backup_path().and_then(|backup| fs::read_to_string(backup).ok()).and_then(|contents| serde_json::from_str::<Settings>(&contents).ok());
+    if let Some(mut settings) = primary_settings {
+        if settings.token.trim().is_empty() {
+            if let Some(backup) = backup_settings.as_ref().filter(|candidate| !candidate.token.trim().is_empty()) {
+                settings.token = backup.token.clone();
+                persist(primary, &settings);
+            }
+        }
+        return settings;
+    }
+    if let Some(settings) = backup_settings {
+        persist(primary, &settings);
+        return settings;
+    }
+    Settings::default()
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ReleaseInfo{version:String,url:String,notes:String}
@@ -44,7 +84,8 @@ fn save_settings(settings: Settings, app: tauri::AppHandle, state: State<AppStat
     let panel_changed = old.panel_hotkey != settings.panel_hotkey;
     if send_changed { if !old.send_hotkey.is_empty() { let _ = shortcuts.unregister(old.send_hotkey.as_str()); } shortcuts.register(settings.send_hotkey.as_str()).map_err(|e| e.to_string())?; }
     if panel_changed { if !old.panel_hotkey.is_empty() { let _ = shortcuts.unregister(old.panel_hotkey.as_str()); } shortcuts.register(settings.panel_hotkey.as_str()).map_err(|e| e.to_string())?; }
-    let mut stored=settings.clone(); stored.token=encrypt_token(&stored.token.trim()); persist(state.data_dir.lock().unwrap().join("settings.json"), &stored);
+    let data_dir = state.data_dir.lock().map_err(|e| e.to_string())?.clone();
+    persist_settings(&data_dir, &settings);
     *state.settings.lock().map_err(|e| e.to_string())? = settings;
     Ok(())
 }
@@ -78,7 +119,8 @@ fn set_autostart(enabled: bool, state: State<AppState>) -> Result<(), String> {
     update_autostart_entry(enabled)?;
     let mut settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
     settings.autostart = enabled;
-    persist(state.data_dir.lock().unwrap().join("settings.json"), &settings);
+    let data_dir = state.data_dir.lock().map_err(|e| e.to_string())?.clone();
+    persist_settings(&data_dir, &settings);
     *state.settings.lock().unwrap() = settings;
     Ok(())
 }
@@ -158,5 +200,5 @@ fn chrono_now() -> String { format!("{}", std::time::SystemTime::now().duration_
 
 pub fn run() {
     let state = AppState { settings: Arc::new(Mutex::new(Settings {send_hotkey:"CTRL+ALT+S".into(),panel_hotkey:"CTRL+ALT+V".into(),..Default::default()})), messages: Arc::new(Mutex::new(Vec::new())), data_dir: Arc::new(Mutex::new(PathBuf::new())) };
-    tauri::Builder::default().plugin(tauri_plugin_notification::init()).plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| { if event.state() == ShortcutState::Pressed { let key=normalize_hotkey(&shortcut.to_string()); let settings=app.state::<AppState>().settings.lock().unwrap().clone(); let panel=normalize_hotkey(&settings.panel_hotkey); if false { if let Some(main)=app.get_webview_window("main"){let _=main.hide();} if let Some(quick)=app.get_webview_window("quick-send"){let _=quick.hide();} if let Some(progress)=app.get_webview_window("upload-progress"){let _=progress.hide();} let handle=app.clone(); thread::spawn(move || { thread::sleep(Duration::from_millis(180)); let _=handle.emit("screenshot-refresh",()); if let Some(w)=handle.get_webview_window("screenshot-select"){let _=w.show();let _=w.set_always_on_top(true);let _=w.set_focus();} else {let _=WebviewWindowBuilder::new(&handle,"screenshot-select",WebviewUrl::App("screenshot.html".into())).title("截图").fullscreen(true).decorations(false).always_on_top(true).skip_taskbar(true).build();} }); } if key==panel { if let Some(window)=app.get_webview_window("quick-send"){let _=window.unminimize();let _=window.set_always_on_top(true);let _=window.show();let _=window.set_focus();} else { let _=WebviewWindowBuilder::new(app,"quick-send",WebviewUrl::App("index.html?quick=1".into())).title("快速发送 · TG Bot Sync").inner_size(560.0,360.0).min_inner_size(460.0,300.0).resizable(true).decorations(false).always_on_top(true).skip_taskbar(true).center().build(); } } let _ = app.emit("global-hotkey", shortcut.to_string()); } }).build()).manage(state.clone()).invoke_handler(tauri::generate_handler![check_update,download_update,get_settings,save_settings,recent_messages,search_messages,copy_message,send_text_message,send_clipboard,send_clipboard_image,send_file,choose_files,choose_file,choose_and_send_file,prepare_clipboard_image,open_file,copy_image,set_autostart]).setup(move |app| { let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?; let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?; let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?; let _quick = WebviewWindowBuilder::new(app,"quick-send",WebviewUrl::App("index.html?quick=1".into())).title("快速发送 · TG Bot Sync").inner_size(560.0,360.0).min_inner_size(460.0,300.0).resizable(true).decorations(false).always_on_top(true).skip_taskbar(true).visible(false).center().build()?; let _progress = WebviewWindowBuilder::new(app,"upload-progress",WebviewUrl::App("progress.html".into())).title("上传进度 · TG Bot Sync").inner_size(440.0,300.0).min_inner_size(360.0,220.0).resizable(true).decorations(false).always_on_top(true).skip_taskbar(true).visible(false).center().build()?; let tray_builder = TrayIconBuilder::new().menu(&menu); let tray_builder = if let Some(icon)=app.default_window_icon(){tray_builder.icon(icon.clone())}else{tray_builder}; let started_from_autostart=std::env::args().any(|arg|arg=="--autostart"); if started_from_autostart { if let Some(main)=app.get_webview_window("main"){let _=main.hide();} } let _tray = tray_builder.on_menu_event(|app,event| { match event.id().as_ref() { "show" => { if let Some(w)=app.get_webview_window("main") { let _=w.unminimize(); let _=w.show(); let _=w.set_focus(); } }, "quit" => app.exit(0), _=>{} } }).on_tray_icon_event(|app,event| { match event { TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => { if let Some(w)=app.app_handle().get_webview_window("main") { let _=w.unminimize(); let _=w.show(); let _=w.set_focus(); } }, _=>{} } }).build(app)?; let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from(".")); let _ = fs::create_dir_all(&data_dir); *state.data_dir.lock().unwrap() = data_dir.clone(); let mut loaded:Settings = load(data_dir.join("settings.json")); loaded.token=decrypt_token(&loaded.token).trim().to_string(); if loaded.send_hotkey.is_empty(){loaded.send_hotkey="CTRL+ALT+S".into();} if loaded.panel_hotkey.is_empty(){loaded.panel_hotkey="CTRL+ALT+V".into();} update_autostart_entry(loaded.autostart)?; *state.settings.lock().unwrap() = loaded.clone(); db_init(&data_dir.join("messages.sqlite")); *state.messages.lock().unwrap() = load(data_dir.join("messages.json")); if let Err(error)=app.global_shortcut().register(loaded.send_hotkey.as_str()){let _=app.emit("hotkey-error",format!("发送快捷键注册失败：{error}"));} if let Err(error)=app.global_shortcut().register(loaded.panel_hotkey.as_str()){let _=app.emit("hotkey-error",format!("面板快捷键注册失败：{error}"));} poll_loop(app.handle().clone(), state.clone()); Ok(()) }).run(tauri::generate_context!()).expect("error while running tauri application");
+    tauri::Builder::default().plugin(tauri_plugin_notification::init()).plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(|app, shortcut, event| { if event.state() == ShortcutState::Pressed { let key=normalize_hotkey(&shortcut.to_string()); let settings=app.state::<AppState>().settings.lock().unwrap().clone(); let panel=normalize_hotkey(&settings.panel_hotkey); if false { if let Some(main)=app.get_webview_window("main"){let _=main.hide();} if let Some(quick)=app.get_webview_window("quick-send"){let _=quick.hide();} if let Some(progress)=app.get_webview_window("upload-progress"){let _=progress.hide();} let handle=app.clone(); thread::spawn(move || { thread::sleep(Duration::from_millis(180)); let _=handle.emit("screenshot-refresh",()); if let Some(w)=handle.get_webview_window("screenshot-select"){let _=w.show();let _=w.set_always_on_top(true);let _=w.set_focus();} else {let _=WebviewWindowBuilder::new(&handle,"screenshot-select",WebviewUrl::App("screenshot.html".into())).title("截图").fullscreen(true).decorations(false).always_on_top(true).skip_taskbar(true).build();} }); } if key==panel { if let Some(window)=app.get_webview_window("quick-send"){let _=window.unminimize();let _=window.set_always_on_top(true);let _=window.show();let _=window.set_focus();} else { let _=WebviewWindowBuilder::new(app,"quick-send",WebviewUrl::App("index.html?quick=1".into())).title("快速发送 · TG Bot Sync").inner_size(560.0,360.0).min_inner_size(460.0,300.0).resizable(true).decorations(false).always_on_top(true).skip_taskbar(true).center().build(); } } let _ = app.emit("global-hotkey", shortcut.to_string()); } }).build()).manage(state.clone()).invoke_handler(tauri::generate_handler![check_update,download_update,get_settings,save_settings,recent_messages,search_messages,copy_message,send_text_message,send_clipboard,send_clipboard_image,send_file,choose_files,choose_file,choose_and_send_file,prepare_clipboard_image,open_file,copy_image,set_autostart]).setup(move |app| { let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?; let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?; let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?; let _quick = WebviewWindowBuilder::new(app,"quick-send",WebviewUrl::App("index.html?quick=1".into())).title("快速发送 · TG Bot Sync").inner_size(560.0,360.0).min_inner_size(460.0,300.0).resizable(true).decorations(false).always_on_top(true).skip_taskbar(true).visible(false).center().build()?; let _progress = WebviewWindowBuilder::new(app,"upload-progress",WebviewUrl::App("progress.html".into())).title("上传进度 · TG Bot Sync").inner_size(440.0,300.0).min_inner_size(360.0,220.0).resizable(true).decorations(false).always_on_top(true).skip_taskbar(true).visible(false).center().build()?; let tray_builder = TrayIconBuilder::new().menu(&menu); let tray_builder = if let Some(icon)=app.default_window_icon(){tray_builder.icon(icon.clone())}else{tray_builder}; let started_from_autostart=std::env::args().any(|arg|arg=="--autostart"); if started_from_autostart { if let Some(main)=app.get_webview_window("main"){let _=main.hide();} } let _tray = tray_builder.on_menu_event(|app,event| { match event.id().as_ref() { "show" => { if let Some(w)=app.get_webview_window("main") { let _=w.unminimize(); let _=w.show(); let _=w.set_focus(); } }, "quit" => app.exit(0), _=>{} } }).on_tray_icon_event(|app,event| { match event { TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => { if let Some(w)=app.app_handle().get_webview_window("main") { let _=w.unminimize(); let _=w.show(); let _=w.set_focus(); } }, _=>{} } }).build(app)?; let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from(".")); let _ = fs::create_dir_all(&data_dir); *state.data_dir.lock().unwrap() = data_dir.clone(); let mut loaded:Settings = load_settings(&data_dir); loaded.token=decrypt_token(&loaded.token).trim().to_string(); if loaded.send_hotkey.is_empty(){loaded.send_hotkey="CTRL+ALT+S".into();} if loaded.panel_hotkey.is_empty(){loaded.panel_hotkey="CTRL+ALT+V".into();} update_autostart_entry(loaded.autostart)?; *state.settings.lock().unwrap() = loaded.clone(); db_init(&data_dir.join("messages.sqlite")); *state.messages.lock().unwrap() = load(data_dir.join("messages.json")); if let Err(error)=app.global_shortcut().register(loaded.send_hotkey.as_str()){let _=app.emit("hotkey-error",format!("发送快捷键注册失败：{error}"));} if let Err(error)=app.global_shortcut().register(loaded.panel_hotkey.as_str()){let _=app.emit("hotkey-error",format!("面板快捷键注册失败：{error}"));} poll_loop(app.handle().clone(), state.clone()); Ok(()) }).run(tauri::generate_context!()).expect("error while running tauri application");
 }
